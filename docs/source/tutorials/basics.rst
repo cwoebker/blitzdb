@@ -18,7 +18,7 @@ Working with Documents
 Just like in Python, in Blitz all documents are objects. To create a new type of document, you just define a class that derives from :py:class:`blitzdb.document.Document`:
 
 .. code-block:: python
-    
+
     from blitzdb import Document
 
     class Actor(Document):
@@ -33,7 +33,7 @@ That's it! We can now create and work with instances of `Actor` and `Movie` docu
 
     charlie_chaplin = Actor({
                              'first_name' : 'Charlie',
-                             'last_name' : 'Chaplin', 
+                             'last_name' : 'Chaplin',
                              'is_funny' : True,
                              'birth_year' : 1889,
                              'filmography' : [
@@ -77,7 +77,11 @@ if none should be present. The backend provides various functions such as :py:me
 
 .. note::
 
-   You can choose between different formats to store your documents when using the file-based backend, using e.g. the `json`, `pickle` or `marshal` Python libraries. By default, all documents will be stored as gzipped JSON files.
+    You can choose between different formats to store your documents when using the file-based backend, using e.g. the `json`, `pickle` or `marshal` Python libraries. Choose the document format when creating the backend by passing a configuration dictionary, e.g. ``backend = FileBackend("./my-db", {'serializer_class': 'pickle'})`` (``'serializer_class'`` can also be ``'json'`` or ``'marshal'``). By default, all documents will be stored as gzipped JSON files.
+
+.. warning::
+
+    The default serializer class is ``'json'``, but this does not allow a perfect roundtrip from python to JSON and back. Python supports many more datatypes than JSON, see the `python JSON documentation <https://docs.python.org/2/library/json.html>`__.
 
 Inserting Documents
 -------------------
@@ -125,7 +129,7 @@ Alternatively, if we know the `primary key` of the object, we can just specify t
 
     **Pro-Tip**
 
-    If Blitz can't find a document matching your query, it will raise a :py:class:`Document.DoesNotExist <blitzdb.document.Document.DoesNotExist>` exception. Likewise, if it finds more than one document matching your query it will raise :py:class:`Document.MultipleObjectsReturned <blitzdb.document.Document.MultipleObjectsReturned>`. These exceptions are specific to the document class to which they belong and can be accessed as attributes of it, e.g. like this: 
+    If Blitz can't find a document matching your query, it will raise a :py:class:`Document.DoesNotExist <blitzdb.document.Document.DoesNotExist>` exception. Likewise, if it finds more than one document matching your query it will raise :py:class:`Document.MultipleDocumentsReturned <blitzdb.document.Document.MultipleDocumentsReturned>`. These exceptions are specific to the document class to which they belong and can be accessed as attributes of it, e.g. like this:
 
     .. code-block:: python
 
@@ -134,7 +138,7 @@ Alternatively, if we know the `primary key` of the object, we can just specify t
         except Actor.DoesNotExist:
             #no 'Charlie' in the database
             pass
-        except Actor.MultipleObjectsReturned:
+        except Actor.MultipleDocumentsReturned:
             #more than one 'Charlie' in the database
             pass
 
@@ -188,7 +192,7 @@ Databases are pretty useless if there's no way to define **relationships** betwe
     modern_times.actors = [charlie_chaplin]
 
     #this will automatically save the movie object as well
-    backend.save(charlie_chaplin) 
+    backend.save(charlie_chaplin)
 
 Internally, BlitzDB converts any `Document` instance that it encounters inside a document to a database reference that contains the primary key of the embedded document and the the name of the collection in which it is stored. Like this, if we reload the actor from the database, the embedded movie objects will get automatically (lazy-)loaded as well:
 
@@ -200,7 +204,7 @@ Internally, BlitzDB converts any `Document` instance that it encounters inside a
     assert isinstance(actor.movies[0],Movie)
 
     #will print 'Modern Times'
-    print actor.movies[0].title 
+    print actor.movies[0].title
 
 .. note::
 
