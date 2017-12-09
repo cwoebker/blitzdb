@@ -1,6 +1,9 @@
 import copy
 import uuid
 
+from blitzdb.fields.base import BaseField
+from blitzdb.fields import CharField
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -10,6 +13,18 @@ import six
 if six.PY3:
     unicode = str
 
+class DoesNotExist(BaseException):
+
+    def __str__(self):
+        message = BaseException.__str__(self)
+        return u"DoesNotExist({}): {}".format(self.__class__.__name__, message)
+
+class MultipleDocumentsReturned(BaseException):
+
+    def __str__(self):
+        message = BaseException.__str__(self)
+        return u"MultipleDocumentsReturned({}): {}".format(self.__class__.__name__, message)
+
 class MetaDocument(type):
 
     """
@@ -17,34 +32,52 @@ class MetaDocument(type):
     """
 
     def __new__(meta, name, bases, dct):
-
-        class DoesNotExist(BaseException):
-
-            def __str__(self):
-                return "DoesNotExist(%s)" % name
-
-        class MultipleDocumentsReturned(BaseException):
-
-            def __str__(self):
-                return "MultipleDocumentsReturned(%s)" % name
-
-        dct['DoesNotExist'] = DoesNotExist
-        dct['MultipleDocumentsReturned'] = MultipleDocumentsReturned
+        sanitized_dct = {}
+        sanitized_dct['fields'] = {}
 
         class_type = type.__new__(meta, name, bases, dct)
 
+        fields = {}
+
+        #we inherit the fields from the base type(s)
+        if hasattr(class_type,'fields'):
+            fields.update(class_type.fields)
+
+        for key,value in dct.items():
+            if isinstance(value,BaseField):
+                if value.key:
+                    field_key = value.key
+                else:
+                    field_key = key
+                fields[field_key] = value
+                delattr(class_type,key)
+
+        class_type.fields = fields
+
+        global DoesNotExist,MultipleDocumentsReturned
+
+        class DoesNotExist(DoesNotExist):
+            pass
+
+        class MultipleDocumentsReturned(MultipleDocumentsReturned):
+            pass
+
+        class_type.DoesNotExist = DoesNotExist
+        class_type.MultipleDocumentsReturned = MultipleDocumentsReturned
+
         if class_type in document_classes:
             document_classes.remove(class_type)
-        if name == 'Document' and bases == (BaseDocument,):
+        if name == 'Document' and bases == (object,):
             pass
-        else:
+        elif not (hasattr(class_type.Meta,'autoregister') and class_type.Meta.autoregister == False):
             document_classes.append(class_type)
+
         return class_type
 
 document_classes = []
 
-
-class BaseDocument(object):
+@six.add_metaclass(MetaDocument)
+class Document(object):
 
     """
     The Document object is the base class for all documents stored in the database.
@@ -53,10 +86,10 @@ class BaseDocument(object):
 
     :param attributes: the attributes of the document instance. Expects a Python dictionary.
     :param lazy: if set to `True`, will lazily load the document from the backend when
-                 an attribute is requested. This requires that `default_backend` has been
-                 specified and that the `pk` attribute is set. 
+                 an attribute is requested. This requires that `backend` has been
+                 specified and that the `pk` attribute is set.
 
-    :param default_backend: the default backend to be used for saving and loading the document.
+    :param backend: the backend to be used for saving and loading the document.
 
 
     **The `Meta` attribute**
@@ -80,7 +113,7 @@ class BaseDocument(object):
 
        marlon = Actor({'name' : 'Marlon Brando', 'birth_year' : 1924})
 
-       print "%s was born in %d" % (marlon.name,marlon.birth_year)
+       print("%s was born in %d" % (marlon.name,marlon.birth_year))
 
     In case one of your attributes shadows a class attribute or function, you can still access it
     using the `attributes` attribute.
@@ -89,9 +122,9 @@ class BaseDocument(object):
 
       fail = Document({'delete': False,'save' : True})
 
-      print fail.delete #will print <bound method Document.save ...>
+      print(fail.delete) #will print <bound method Document.save ...>
 
-      print fail.attributes['delete'] #will print 'False'
+      print(fail.attributes['delete']) #will print 'False'
 
     **Defining "non-database" attributes**
 
@@ -100,81 +133,79 @@ class BaseDocument(object):
     define e.g. some helper variables that you don't want to store in the database.
     """
 
+    abstract = True
+
     class Meta:
 
+        PkType = CharField(length = 32,primary_key = True,indexed = True,nullable = False)
         primary_key = "pk"
+        indexes = {}
 
-    def __init__(self, attributes=None, lazy=False, default_backend=None, autoload=True):
+    def __init__(self, attributes=None, lazy=False, backend=None, autoload=True, db_loader = None):
         """
-        Initializes a document instance with the given attributes. If `lazy = True`, a *lazy* document
-        will be created, which means that the attributes of the document will be loaded from the database
-        only if they are requested. Lazy loading requires that the `default_backend` variable is set.
+        Initializes a document instance with the given attributes. If `lazy = True`, a *lazy*
+        document will be created, which means that the attributes of the document will be loaded
+        from the database only if they are requested. Lazy loading requires that the `backend`
+        variable is set.
 
         :param attributes: the attributes of the document instance.
 
-        :param lazy: specifies if the document is *lazy*, i.e. if it should be loaded on demand when its attributes get accessed for the first time.
-
-        :param default_backend: the default backend for use in the `save`, `delete` and `revert` functions.
+        :param lazy: specifies if the document is *lazy*, i.e. if it should be loaded on demand
+                     when its attributes get accessed for the first time.
+        :param autoload: if True, will automatically fetch the document from the database if it is
+                         lazy and the user tries to access an attribute that does not yet exist.
+        :param backend: the backend for use in the `save`, `delete` and `revert` functions.
 
         """
         if not attributes:
             attributes = {}
-        self.__dict__['_attributes'] = attributes
-        self.__dict__['embed'] = False
-        self.__dict__['_autoload'] = autoload
-        self._default_backend = default_backend
-        if self.pk is None:
-            self.pk = None
+
+        self._attributes = attributes
+        self._autoload = autoload
+        self._backend = backend
+        self._properties = {}
+        self._db_loader = db_loader
 
         if not lazy:
             self._lazy = False
-            self.initialize()
         else:
             self._lazy = True
 
+        self._embed = False
+        self.initialize()
+
     def __getitem__(self,key):
         try:
-            lazy = super(BaseDocument,self).__getattribute__('_lazy')
+            lazy = super(Document,self).__getattribute__('_lazy')
         except AttributeError:
             lazy = False
         if lazy:
             if key in self.lazy_attributes:
                 return self.lazy_attributes[key]
-            else:
-                self.revert()
-                self._lazy = False
+            self.revert(implicit=True)
         return self.attributes[key]
 
-    def __getattribute__(self,key):
-        """
-        Checks if the `_lazy` attribute of the document is set. If this is the case, the function
-        lazily loads the document from the database by calling `revert` and sets `_lazy = False'
-        after doing so.
-        """
-        try:
-            lazy = super(BaseDocument, self).__getattribute__('_lazy')
-        except AttributeError:
-            lazy = False
-        if lazy:
-            if key == 'lazy_attributes':
-                return super(BaseDocument, self).__getattribute__('_attributes')
-            # If we demand the attributes, we load the object from the DB in any case.
-            if key in ('attributes',):
-                if self._autoload:
-                    self.revert()
-                    self._lazy = False
-                else:
-                    return super(BaseDocument, self).__getattribute__('_attributes')
-            try:
-                return super(BaseDocument, self).__getattribute__(key)
-            except AttributeError:
-                pass
-            if key in self.lazy_attributes:
-                return self.lazy_attributes[key]
-            elif self._autoload:
-                self.revert()
-                self._lazy = False
-        return super(BaseDocument,self).__getattribute__(key)
+    @property
+    def lazy(self):
+        return self._lazy
+
+    @lazy.setter
+    def lazy(self,lazy):
+        self._lazy = lazy
+
+    @property
+    def lazy_attributes(self):
+        return self._attributes
+
+    @property
+    def attributes(self):
+        if self._lazy:
+            self.revert(implicit=True)
+        return self._attributes
+
+    @attributes.setter
+    def attributes(self,value):
+        self._attributes = value
 
     def get(self,key,default = None):
         return self[key] if key in self else default
@@ -194,34 +225,51 @@ class BaseDocument(object):
     def items(self):
         return self.attributes.items()
 
+    @property
+    def properties(self):
+        return self._properties
+
+    @properties.setter
+    def properties(self,value):
+        self._properties = value
+
     def __contains__(self, key):
-        return True if key in self.attributes else False
+        return True if (key in self.lazy_attributes or key in self.attributes) else False
 
     def __iter__(self):
         for key in self.keys():
             yield key
 
-    def __getattr__(self, key):
+    def get_lazy_attribute(self,key):
+        #we make sure not to revert the document...
+        return object.__getattribute__(self,key)
+
+    def __getattr__(self, key,load_if_lazy = True):
+
         try:
-            super(BaseDocument, self).__getattr__(key)
+            return super(Document,self).__getattr__(key)
         except AttributeError:
-            try:
-                return self.attributes[key]
-            except KeyError:
-                raise AttributeError(key)
+            pass
+        try:
+            if key in self._properties:
+                return self._properties[key]
+            if key in self._attributes:
+                return self._attributes[key]
+            if self._lazy:
+                self.revert(implicit=True)
+            return self._attributes[key]
+        except KeyError:
+            raise AttributeError(key)
 
     def __setattr__(self, key, value):
-        if key.startswith('_'):
-            return super(BaseDocument, self).__setattr__(key, value)
-        elif key == 'pk':
-            # this is ugly, should find a better solution for handling properties...
-            super(BaseDocument, self).__setattr__(key, value)
+        if key.startswith('_') or key in ('attributes','pk','lazy','backend'):
+            return super(Document, self).__setattr__(key, value)
         else:
             self.attributes[key] = value
 
     def __delattr__(self, key):
         if key.startswith('_'):
-            return super(BaseDocument, self).__delattr__(key)
+            return super(Document, self).__delattr__(key)
         try:
             del self.attributes[key]
         except KeyError:
@@ -236,11 +284,13 @@ class BaseDocument(object):
             raise KeyError(key)
 
     def __copy__(self):
-        d = self.__class__(self.attributes.copy(), lazy=self._lazy, default_backend = self._default_backend)
+        d = self.__class__(self.attributes.copy(), lazy=self._lazy, backend = self._backend)
         return d
 
     def __deepcopy__(self, memo):
-        d = self.__class__(copy.deepcopy(self.attributes, memo), lazy=self._lazy, default_backend=self._default_backend)
+        d = self.__class__(copy.deepcopy(self.attributes, memo),
+                           lazy=self._lazy,
+                           backend =self._backend)
         return d
 
     def __hash__(self):
@@ -248,7 +298,12 @@ class BaseDocument(object):
 
     def __ne__(self, other):
         return not self.__eq__(other)
-    
+
+    def __nonzero__(self):
+        if self.pk:
+            return True
+        return False
+
     def __eq__(self, other):
         """
         Compares the document instance to another object. The comparison rules are as follows:
@@ -271,7 +326,7 @@ class BaseDocument(object):
         return False
 
     def __unicode__(self):
-        return self.__class__.__name__ + "({%s : '%s'},lazy = %s)" % (self.get_pk_name(), self.pk, self._lazy)
+        return self.__class__.__name__ + "({{{0} : '{1}'}},lazy = {2})".format(self.get_pk_name(), self.pk, self._lazy)
 
     if six.PY3:
         __str__ = __unicode__
@@ -302,17 +357,17 @@ class BaseDocument(object):
 
     def initialize(self):
         """
-        Gets called when **after** the object attributes get loaded from the database. 
+        Gets called when **after** the object attributes get loaded from the database.
         Redefine it in your document class to perform object initialization tasks.
 
         .. admonition:: Keep in Mind
 
-            The function also get called after invoking the `revert` function, which 
+            The function also get called after invoking the `revert` function, which
             resets the object attributes to those in the database, so do not assume that
             the function will get called only once during the lifetime of the object.
 
-            Likewise, you should **not** perform any initialization in the `__init__` 
-            function to initialize your object, since this can possibly break lazy loading 
+            Likewise, you should **not** perform any initialization in the `__init__`
+            function to initialize your object, since this can possibly break lazy loading
             and `revert` operations.
         """
         pass
@@ -321,11 +376,12 @@ class BaseDocument(object):
         """
         Autogenerates a primary key for this document. This function gets called by the backend
         if you save a document without a primary key field. By default, it uses `uuid.uuid4().hex`
-        to generate a (statistically) unique primary key for the object (`more about UUIDs <http://docs.python.org/2/library/uuid.html/>`_). 
+        to generate a (statistically) unique primary key for the object (`more about UUIDs
+        <https://docs.python.org/2/library/uuid.html>`_).
         If you want to define your own primary key generation mechanism, just redefine this function
         in your document class.
         """
-        self.pk = uuid.uuid4().hex 
+        self.pk = uuid.uuid4().hex
 
     @classmethod
     def get_pk_name(cls):
@@ -335,9 +391,9 @@ class BaseDocument(object):
     def pk(self):
         """
         Returns (or sets) the primary key of the document, which is stored in the `attributes` dict
-        along with all other attributes. The name of the primary key defaults to `pk` and 
+        along with all other attributes. The name of the primary key defaults to `pk` and
         can be redefine in the `Meta` class. This function provides a standardized way to
-        retrieve and set the primary key of a document and is used by the backend and a 
+        retrieve and set the primary key of a document and is used by the backend and a
         few other classes. If possible, always use this function to access the
         primary key of a document.
 
@@ -351,64 +407,76 @@ class BaseDocument(object):
         """
         primary_key = self.get_pk_name()
         if primary_key in self._attributes:
-            return self._attributes[self.get_pk_name()]
+            return self._attributes[primary_key]
+
+        #if there is no pk value but a _db_loader, we load the object lazily to retrieve the pk
+        if self._lazy and self._db_loader:
+            self.revert(implicit=True)
+            if primary_key in self._attributes:
+                return self._attributes[primary_key]
+
         return None
 
     @property
+    def embed(self):
+        return self._embed
+
+    @property
     def eager(self):
-        self.load_if_lazy()
-        return self
+        return self.load_if_lazy()
 
     @pk.setter
     def pk(self, value):
         self._attributes[self.get_pk_name()] = value
 
     @property
-    def attributes(self):
-        """
-        Returns a reference to the attributes of the document. The attributes are the *"unique source of truth"*
-        about the state of a document.
-        """
-        return self._attributes
+    def backend(self):
+        return self._backend
+
+    @backend.setter
+    def backend(self,backend):
+        self._backend = backend
 
     def save(self, backend=None):
         """
-        Saves a document to the database. If the `backend` argument is not specified, the function resorts
-        to the *default backend* as defined during object instantiation. If no such backend is defined, an
-        `AttributeError` exception will be thrown.
+        Saves a document to the database. If the `backend` argument is not specified,
+        the function resorts to the *default backend* as defined during object instantiation.
+        If no such backend is defined, an `AttributeError` exception will be thrown.
 
         :param backend: the backend in which to store the document.
 
         """
         if not backend:
-            if not self._default_backend:
+            if not self._backend:
                 raise AttributeError("No default backend defined!")
-            return self._default_backend.save(self)
+            return self._backend.save(self)
+        self._backend = backend
         return backend.save(self)
 
     def delete(self, backend=None):
         """
-        Deletes a document from the database. If the `backend` argument is not specified, the function resorts
-        to the *default backend* as defined during object instantiation. If no such backend is defined, an
-        `AttributeError` exception will be thrown.
+        Deletes a document from the database. If the `backend` argument is not specified,
+        the function resorts to the *default backend* as defined during object instantiation.
+        If no such backend is defined, an `AttributeError` exception will be thrown.
 
         :param backend: the backend from which to delete the document.
 
         """
         if not backend:
-            if not self._default_backend:
+            if not self._backend:
                 raise AttributeError("No default backend defined!")
-            return self._default_backend.delete(self)
+            return self._backend.delete(self)
         backend.delete(self)
 
-    def revert(self, backend=None):
+    def revert(self, backend=None, implicit=False):
         """
-        Reverts the state of the document to that contained in the database. 
-        If the `backend` argument is not specified, the function resorts to the *default backend* 
-        as defined during object instantiation. If no such backend is defined, an `AttributeError` 
+        Reverts the state of the document to that contained in the database.
+        If the `backend` argument is not specified, the function resorts to the *default backend*
+        as defined during object instantiation. If no such backend is defined, an `AttributeError`
         exception will be thrown.
 
         :param backend: the backend from which to delete the document.
+        :param implicit: whether the loading was triggered implicitly (e.g. by accessing attributes)
 
         .. admonition:: Keep in Mind
 
@@ -416,23 +484,24 @@ class BaseDocument(object):
             allows you to perform document-specific initialization tasks if needed.
 
         """
-        logger.debug("Reverting to database state (%s, %s)" % (self.__class__.__name__, self.pk))
-        backend = backend or self._default_backend
-        if not backend:
-            raise AttributeError("No backend given!")
-        if self.pk == None:
-            raise self.DoesNotExist("No primary key given!")
-        obj = self._default_backend.get(self.__class__, {self.get_pk_name(): self.pk})
+        if implicit and not self._autoload:
+            logger.debug("Autoloading is disabled, not reverting the document implicitly...")
+            return
+        self._lazy = False
+        logger.debug("Reverting to database state (%s, %s)" % (self.__class__.__name__, str(self.pk)))
+        if self._db_loader:
+            obj = self._db_loader()
+        else:
+            backend = backend or self._backend
+            if not backend:
+                raise AttributeError("No backend given!")
+            if self.pk is None:
+                return
+            obj = backend.get(self.__class__, {self.get_pk_name(): self.pk})
         self._attributes = obj.attributes
         self.initialize()
 
-    def load_if_lazy(self):
-        try:
-            lazy = super(BaseDocument, self).__getattribute__('_lazy')
-        except AttributeError:
-            lazy = False
-        if lazy:
-            self._lazy = False
-            self.revert()
-
-Document = MetaDocument('Document', (BaseDocument,), {})
+    def load_if_lazy(self, implicit=False):
+        if self._lazy:
+            self.revert(implicit=implicit)
+        return self

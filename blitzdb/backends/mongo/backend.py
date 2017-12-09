@@ -13,7 +13,29 @@ import pymongo
 import logging
 import traceback
 
+from blitzdb.helpers import get_value,set_value,delete_value
+
 logger = logging.getLogger(__name__)
+
+class DotEncoder(object):
+
+    DOT_MAGIC_VALUE = ":a5b8afc131:"
+
+    @classmethod
+    def encode(cls,obj,path):
+        def replace_key(key):
+            if isinstance(key,six.string_types):
+                return key.replace(".", cls.DOT_MAGIC_VALUE)
+            return key
+        if isinstance(obj,dict):
+            return dict([(replace_key(key),value) for key, value in obj.items()])
+        return obj
+
+    @classmethod
+    def decode(cls,obj):
+        if isinstance(obj,dict):
+            return {key.replace(cls.DOT_MAGIC_VALUE, "."): value for key, value in obj.items()}
+        return obj
 
 class Backend(BaseBackend):
 
@@ -36,29 +58,24 @@ class Backend(BaseBackend):
         backend = MongoBackend(my_db)
     """
 
-    # magic value to replace '.' characters in dictionary keys (which breaks MongoDB)
-    DOT_MAGIC_VALUE = ":a5b8afc131:"
+    standard_encoders = BaseBackend.standard_encoders + [DotEncoder]
 
-    def __init__(self, db, autocommit=False, **kwargs):
+    def __init__(self, db, autocommit=False, use_pk_based_refs = True,**kwargs):
+        super(Backend, self).__init__(**kwargs)
         self.db = db
-        self.classes = {}
-        self.collections = {}
         self._autocommit = autocommit
         self._save_cache = defaultdict(lambda: {})
         self._delete_cache = defaultdict(lambda: {})
         self._update_cache = defaultdict(lambda: {})
+        self._use_pk_based_refs = use_pk_based_refs
         self.in_transaction = False
-        super(Backend, self).__init__(**kwargs)
-
-    def escape_dots(self,value):
-        return value.replace(".",self.DOT_MAGIC_VALUE)
 
     def begin(self):
         if self.in_transaction:  # we're already in a transaction...
             self.commit()
         self.in_transaction = True
 
-    def rollback(self):
+    def rollback(self,transaction = None):
         if not self.in_transaction:
             raise NotInTransaction("Not in a transaction!")
         
@@ -68,14 +85,14 @@ class Backend(BaseBackend):
         
         self.in_transaction = False
 
-    def commit(self):
+    def commit(self,transaction = None):
         try:
             for collection, cache in self._save_cache.items():
                 for pk, attributes in cache.items():
                     try:
                         self.db[collection].save(attributes)
                     except:
-                        logger.error("Error when saving the document with pk %s in collection %s" % (attributes['pk'], collection))
+                        logger.error("Error when saving the document with pk {0} in collection {1}".format(attributes['pk'], collection))
                         logger.error("Attributes (excerpt):" + str(dict(attributes.items()[:100])))
                         raise
 
@@ -118,11 +135,12 @@ class Backend(BaseBackend):
             self._delete_cache[collection].update(dict([(pk, True) for pk in pks]))
 
     def delete(self, obj):
+
+        self.call_hook('before_delete',obj)
+
         collection = self.get_collection_for_cls(obj.__class__)
         if obj.pk == None:
             raise obj.DoesNotExist
-        if hasattr(obj, 'pre_delete') and callable(obj.pre_delete):
-            obj.pre_delete()
         if self.autocommit:
             self.db[collection].remove({'_id': obj.pk})
         else:
@@ -136,8 +154,7 @@ class Backend(BaseBackend):
         serialized_attributes_list = []
         collection = self.get_collection_for_cls(objs[0].__class__)
         for obj in objs:
-            if hasattr(obj, 'pre_save') and callable(obj.pre_save):
-                obj.pre_save()
+            self.call_hook('before_save',obj)
             if obj.pk == None:
                 obj.pk = uuid.uuid4().hex
             serialized_attributes = self.serialize(obj.attributes)
@@ -155,70 +172,28 @@ class Backend(BaseBackend):
         return self.save_multiple([obj])
 
     def update(self, obj, set_fields=None, unset_fields=None, update_obj=True):
+
         collection = self.get_collection_for_cls(obj.__class__)
-        if hasattr(obj, 'pre_save') and callable(obj.pre_save):
-            obj.pre_save()
 
         if obj.pk == None:
             raise obj.DoesNotExist("update() called on document without primary key!")
 
-        def _get(obj, key):
-            value = obj
-            for elem in key.split("."):
-                if isinstance(value, list):
-                    value = value[int(elem)]
-                else:
-                    value = value[elem]
-            return value
-
-        def _exists(obj, key):
-            value = obj
-            for elem in key.split("."):
-                if isinstance(value, list):
-                    try:
-                        value = value[int(elem)]
-                    except:
-                        return False
-                else:
-                    try:
-                        value = value[elem]
-                    except:
-                        return False
-            return True
-
-        def _set(obj, key,new_value):
-            value = obj
-            last_value = None
-            for elem in key.split("."):
-                if isinstance(value, list):
-                    last_value = value
-                    value = value[int(elem)]
-                else:
-                    last_value = value
-                    value = value[elem]
-            if isinstance(last_value,list):
-                last_value[int(elem)] = new_value
-            else:
-                last_value[elem] = new_value
-            return value
-
         def serialize_fields(fields):
 
 
-            if isinstance(fields, list) or isinstance(fields, tuple):
-                update_dict = {key : _get(obj.attributes,key) for key in fields 
-                                if _exists(obj.attributes,key)}
-                serialized_attributes = {key : self.serialize(value) for key,value in update_dict.items()}
-            elif isinstance(fields, dict):
-                serialized_attributes = {key : self.serialize(value) for key,value in fields.items()}
-                if update_obj:
-                    for key,value in fields.items():
-                        if _exists(obj.attributes,key):
-                            _set(obj.attributes,key,value)
+            if isinstance(fields, (list,tuple)):
+                update_dict = {}
+                for key in fields:
+                    try:
+                        update_dict[key] = get_value(obj,key)
+                    except KeyError:
+                        pass
+            elif isinstance(fields,dict):
+                update_dict = fields.copy()
             else:
                 raise TypeError("fields must be a list/tuple!")
 
-            return serialized_attributes
+            return update_dict
 
         if set_fields:
             set_attributes = serialize_fields(set_fields)
@@ -226,11 +201,24 @@ class Backend(BaseBackend):
             set_attributes = {}
 
         if unset_fields:
-            unset_attributes = unset_fields
+            unset_attributes = list(unset_fields)
         else:
             unset_attributes = []
 
+        self.call_hook('before_update',obj,set_attributes,unset_attributes)
+
+
+        set_attributes = {key : self.serialize(value)
+                                for key,value in set_attributes.items()}
+
+        if update_obj:
+            for key,value in set_attributes.items():
+                set_value(obj,key,value)
+            for key in unset_attributes:
+                delete_value(obj,key)
+
         update_dict = {}
+
         if set_attributes:
             update_dict['$set'] = set_attributes
         if unset_attributes:
@@ -263,66 +251,16 @@ class Backend(BaseBackend):
             else:
                 self._update_cache[collection][obj.pk] = update_dict
 
-    def serialize(self, obj, convert_keys_to_str=True, embed_level=0, encoders=None, autosave=True, for_query=False):
-
-        def encode_dict(obj):
-            """
-            Encodes a dictionary by replacing dots in the keys with a MAGIC value.
-            """
-            def replace_key(key):
-                if isinstance(key,six.string_types):
-                    return key.replace(".", self.DOT_MAGIC_VALUE)
-                return key
-
-            return dict([(replace_key(key),value) for key, value in obj.items()])
-
-        def encode_complex(obj):
-            """
-            Encodes a complex number.
-            """
-            return {'_type' : 'complex','r' : obj.real,'i' : obj.imag}
-
-        if not for_query:
-            standard_encoders = [(lambda obj:True if isinstance(obj, dict) else False, encode_dict)]
-        else:
-            standard_encoders = []
-
-        standard_encoders.append((lambda obj:True if isinstance(obj,complex) else False,encode_complex))
+    def serialize(self, obj, convert_keys_to_str=True, embed_level=0,
+                  encoders=None, autosave=True, for_query=False,path = None):
 
         return super(Backend, self).serialize(obj, 
                                               convert_keys_to_str=convert_keys_to_str, 
                                               embed_level=embed_level, 
-                                              encoders=encoders + standard_encoders if encoders else standard_encoders, 
-                                              autosave=autosave, 
+                                              encoders=encoders, 
+                                              autosave=autosave,
+                                              path=path,
                                               for_query=for_query)
-
-    def deserialize(self, obj, decoders=None):
-
-        def decode_dict(obj):
-            """
-            Decodes a dictionary by substituting the MAGIC value in the keys with a dot.
-            """
-            return dict([(key.replace(self.DOT_MAGIC_VALUE, "."), value) for key, value in obj.items()])
-
-        def decode_complex(obj):
-            """
-            Decodes a complex number.
-            """
-            return 1j*obj['i']+obj['r']
-
-        standard_decoders = [(lambda obj:True if isinstance(obj, dict) 
-                                                and '_type' in obj 
-                                                and obj['_type'] == 'dict' 
-                                                and 'items' in obj 
-                                                else False,
-                              decode_dict),
-                             (lambda obj:True if isinstance(obj,dict)
-                                              and '_type' in obj
-                                              and obj['_type'] == 'complex' else False,
-                              decode_complex)
-        ]
-
-        return super(Backend, self).deserialize(obj, decoders=standard_decoders + decoders if decoders else standard_decoders)
 
     def create_indexes(self, cls_or_collection, params_list):
         for params in params_list:
@@ -356,14 +294,47 @@ class Backend(BaseBackend):
             self.db[collection].drop_index(list(kwargs['fields'].items()))
             self.db[collection].ensure_index(list(kwargs['fields'].items()), **opts)
 
-    def compile_query(self, query):
-        if isinstance(query, dict):
-            return dict([(self.compile_query(key), self.compile_query(value)) 
-                         for key, value in query.items()])
-        elif isinstance(query, list) or isinstance(query, QuerySet) or isinstance(query, tuple):
-            return [self.compile_query(x) for x in query]
-        else:
-            return self.serialize(query, autosave=False, for_query=True)
+    def _canonicalize_query(self, query):
+
+        """
+        Transform the query dictionary to replace e.g. documents with __ref__ fields.
+        """
+
+        def transform_query(q):
+
+            for encoder in self.query_encoders:
+                q = encoder.encode(q,[])
+
+            if isinstance(q, dict):
+                nq = {}
+                for key,value in q.items():
+                    new_key = key
+                    if isinstance(value,dict) and len(value) == 1 and list(value.keys())[0].startswith('$'):
+                        if list(value.keys())[0] in ('$all','$in'):
+                            if list(value.values())[0] and isinstance(list(value.values())[0][0],Document):
+                                if self._use_pk_based_refs:
+                                    new_key+='.pk'
+                                else:
+                                    new_key+='.__ref__'
+                    elif isinstance(value,Document):
+                        if self._use_pk_based_refs:
+                            new_key+='.pk'
+                        else:
+                            new_key+='.__ref__'
+                    nq[new_key] = transform_query(value)
+                return nq
+            elif isinstance(q, (list,QuerySet,tuple)):
+                return [transform_query(x) for x in q]
+            elif isinstance(q,Document):
+                collection = self.get_collection_for_obj(q)
+                if self._use_pk_based_refs:
+                    return q.pk
+                else:
+                    return "%s:%s" % (collection,q.pk)
+            else:
+                return q
+
+        return transform_query(query)
 
     def get(self, cls_or_collection, properties, raw=False, only=None):
         if not isinstance(cls_or_collection, six.string_types):
@@ -386,7 +357,7 @@ class Backend(BaseBackend):
 
         .. note::
 
-            This function supports all query operators that are available in MongoDB and returns 
+            This function supports most query operators that are available in MongoDB and returns 
             a query set that is based on a MongoDB cursor.
 
         """
@@ -398,14 +369,14 @@ class Backend(BaseBackend):
             collection = cls_or_collection
             cls = self.get_cls_for_collection(collection)
 
-        compiled_query = self.compile_query(query)
+        canonical_query = self._canonicalize_query(query)
 
         args = {}
 
-        if only != None:
+        if only:
             if isinstance(only,tuple):
                 args['projection'] = list(only)
             else:
                 args['projection'] = only
 
-        return QuerySet(self, cls, self.db[collection].find(compiled_query, **args), raw=raw, only=only)
+        return QuerySet(self, cls, self.db[collection].find(canonical_query, **args), raw=raw, only=only)

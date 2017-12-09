@@ -6,6 +6,7 @@ from collections import defaultdict
 
 import blitzdb
 
+from blitzdb.document import Document
 from blitzdb.backends.base import (
     Backend as BaseBackend,
     NotInTransaction,
@@ -18,13 +19,13 @@ from blitzdb.backends.file.queries import compile_query
 from blitzdb.backends.file.queryset import QuerySet
 from blitzdb.backends.file.serializers import (
     JsonSerializer,
-    MarshalSerializer,
     PickleSerializer,
 )
 from blitzdb.backends.file.store import (
     Store,
     TransactionalStore,
 )
+from blitzdb.helpers import get_value,set_value,delete_value
 
 import six
 
@@ -42,7 +43,6 @@ index_classes = {
 serializer_classes = {
     'pickle': PickleSerializer,
     'json': JsonSerializer,
-    'marshal': MarshalSerializer
 }
 
 # will only be available if cjson is installed
@@ -109,6 +109,8 @@ class Backend(BaseBackend):
         self.indexes = defaultdict(lambda: {})
         self.index_stores = defaultdict(lambda: {})
         self.load_config(config, overwrite_config)
+        self._auto_transaction = False
+        self.begin()
 
         super(Backend, self).__init__(**kwargs)
 
@@ -125,6 +127,9 @@ class Backend(BaseBackend):
     def begin(self):
         """Start a new transaction."""
         if self.in_transaction:  # we're already in a transaction...
+            if self._auto_transaction:
+                self._auto_transaction = False
+                return
             self.commit()
         self.in_transaction = True
         for collection, store in self.stores.items():
@@ -149,7 +154,7 @@ class Backend(BaseBackend):
     def SerializerClass(self):
         return serializer_classes[self.config['serializer_class']]
 
-    def rollback(self):
+    def rollback(self, transaction = None):
         """Roll back a transaction."""
         if not self.in_transaction:
             raise NotInTransaction
@@ -168,7 +173,7 @@ class Backend(BaseBackend):
                 self.rebuild_indexes(collection, indexes_to_rebuild)
         self.in_transaction = False
 
-    def commit(self):
+    def commit(self,transaction = None):
         """Commit all pending transactions to the database.
 
         .. admonition:: Warning
@@ -247,12 +252,14 @@ class Backend(BaseBackend):
 
         """
         if params:
-            return self.create_indexes(cls_or_collection, [params], ephemeral=ephemeral, unique=unique)
+            return self.create_indexes(cls_or_collection, [params],
+                                       ephemeral=ephemeral, unique=unique)
         elif fields:
             params = []
             if len(fields.items()) > 1:
                 raise ValueError("File backend currently does not support multi-key indexes, sorry :/")
-            return self.create_indexes(cls_or_collection, [{'key': list(fields.keys())[0]}], ephemeral=ephemeral, unique=unique)
+            return self.create_indexes(cls_or_collection, [{'key': list(fields.keys())[0]}],
+                                       ephemeral=ephemeral, unique=unique)
         else:
             raise AttributeError('You must either specify params or fields!')
 
@@ -326,8 +333,8 @@ class Backend(BaseBackend):
         return self.index_stores[collection][store_key]
 
     def register(self, cls, parameters=None):
-        super(Backend, self).register(cls, parameters)
-        self.init_indexes(self.get_collection_for_cls(cls))
+        if super(Backend, self).register(cls, parameters):
+            self.init_indexes(self.get_collection_for_cls(cls))
 
     def get_storage_key_for(self, obj):
         collection = self.get_collection_for_obj(obj)
@@ -364,7 +371,7 @@ class Backend(BaseBackend):
         for key in keys:
             index = self.indexes[collection][key]
             for obj in all_objects:
-                index.add_key(obj.attributes, obj._store_key)
+                index.add_key(self.serialize(obj.attributes), obj._store_key)
             index.commit()
 
     def create_indexes(self, cls_or_collection, params_list, ephemeral=False, unique=False):
@@ -391,7 +398,9 @@ class Backend(BaseBackend):
             else:
                 index_store = self.get_index_store(collection, params['id'])
 
-            index = self.IndexClass(params, serializer=lambda x: self.serialize(x, autosave=False), deserializer=lambda x: self.deserialize(x), store=index_store, unique=unique)
+            index = self.IndexClass(params, serializer=lambda x: self.serialize(x, autosave=False),
+                                    deserializer=lambda x: self.deserialize(x),
+                                    store=index_store, unique=unique)
             self.indexes[collection][params['key']] = index
 
             if collection not in self._config['indexes']:
@@ -429,16 +438,48 @@ class Backend(BaseBackend):
         obj = self.create_instance(cls, data)
         return obj
 
-    def save(self, obj):
+    def update(self, obj, set_fields = None, unset_fields = None, update_obj = True):
+        """
+        We return the result of the save method (updates are not yet implemented here).
+        """
+        if set_fields:
+            if isinstance(set_fields,(list,tuple)):
+                set_attributes = {}
+                for key in set_fields:
+                    try:
+                        set_attributes[key] = get_value(obj,key)
+                    except KeyError:
+                        pass
+            else:
+                set_attributes = set_fields
+        else:
+            set_attributes = {}
+        if unset_fields:
+            unset_attributes = unset_fields
+        else:
+            unset_attributes = []
+
+        self.call_hook('before_update',obj,set_attributes,unset_attributes)
+
+        if update_obj:
+            for key,value in set_attributes.items():
+                set_value(obj,key,value)
+            for key in unset_attributes:
+                delete_value(obj,key)
+
+        return self.save(obj,call_hook = False)
+
+    def save(self, obj,call_hook = True):
+
+        if call_hook:
+            self.call_hook('before_save',obj)
+
         collection = self.get_collection_for_obj(obj)
         indexes = self.get_collection_indexes(collection)
         store = self.get_collection_store(collection)
 
         if obj.pk is None:
             obj.autogenerate_pk()
-
-        if hasattr(obj, 'pre_save') and callable(obj.pre_save):
-            obj.pre_save()
 
         serialized_attributes = self.serialize(obj.attributes)
         data = self.encode_attributes(serialized_attributes)
@@ -455,7 +496,7 @@ class Backend(BaseBackend):
         store.store_blob(data, store_key)
 
         for key, index in indexes.items():
-            index.add_key(obj.attributes, store_key)
+            index.add_key(serialized_attributes, store_key)
 
         if self.config['autocommit']:
             self.commit()
@@ -479,10 +520,11 @@ class Backend(BaseBackend):
             self.commit()
 
     def delete(self, obj):
+
+        self.call_hook('before_delete',obj)
+
         collection = self.get_collection_for_obj(obj)
         primary_index = self.get_pk_index(collection)
-        if hasattr(obj, 'pre_delete') and callable(obj.pre_delete):
-            obj.pre_delete()
         return self.delete_by_store_keys(
             collection, primary_index.get_keys_for(obj.pk))
 
@@ -536,6 +578,30 @@ class Backend(BaseBackend):
 
         return flatten(sort_by_keys(keys, sort_keys))
 
+    def _canonicalize_query(self, query):
+
+        """
+        Transform the query dictionary to replace e.g. documents with __ref__ fields.
+        """
+
+        def transform_query(q):
+
+            if isinstance(q, dict):
+                nq = {}
+                for key,value in q.items():
+                    nq[key] = transform_query(value)
+                return nq
+            elif isinstance(q, (list,QuerySet,tuple)):
+                return [transform_query(x) for x in q]
+            elif isinstance(q,Document):
+                collection = self.get_collection_for_obj(q)
+                ref = "%s:%s" % (collection,q.pk)
+                return ref
+            else:
+                return q
+
+        return transform_query(query)
+
     def filter(self, cls_or_collection, query, initial_keys=None):
 
         if not isinstance(query, dict):
@@ -550,7 +616,7 @@ class Backend(BaseBackend):
 
         store = self.get_collection_store(collection)
         indexes = self.get_collection_indexes(collection)
-        compiled_query = compile_query(self.serialize(query, autosave=False))
+        compiled_query = compile_query(self._canonicalize_query(query))
 
         indexes_to_create = []
 

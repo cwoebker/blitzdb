@@ -30,6 +30,14 @@ def filter_query(key, expression):
             and len(expression) == 1
             and list(expression.keys())[0].startswith('$')):
         compiled_expression = compile_query(expression)
+    elif callable(expression):
+        def _filter(index, expression=expression):
+            result = [store_key
+                      for value, store_keys in index.get_index().items()
+                      if expression(value)
+                      for store_key in store_keys]
+            return result
+        compiled_expression = _filter
     else:
         compiled_expression = expression
 
@@ -114,9 +122,11 @@ def all_query(expression):
         try:
             iter(ev)
         except TypeError:
-            raise AttributeError('$in argument must be an iterable!')
+            raise AttributeError('$all argument must be an iterable!')
+
         hashed_ev = [index.get_hash_for(v) for v in ev]
         store_keys = set([])
+
         if len(hashed_ev) == 0:
             return []
         store_keys = set(index.get_keys_for(hashed_ev[0]))
@@ -156,7 +166,6 @@ def in_query(expression):
 
     return _in
 
-
 def compile_query(query):
     """Compile each expression in query recursively."""
     if isinstance(query, dict):
@@ -164,7 +173,7 @@ def compile_query(query):
         for key, value in query.items():
             if key.startswith('$'):
                 if key not in query_funcs:
-                    raise AttributeError('Invalid operator: %s' % key)
+                    raise AttributeError('Invalid operator: {0}'.format(key))
                 expressions.append(query_funcs[key](value))
             else:
                 expressions.append(filter_query(key, value))

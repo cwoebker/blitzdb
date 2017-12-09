@@ -32,12 +32,14 @@ class QuerySet(object):
         of the query results. This allows user to specify an offset and/or
         limit for the query.
         """
+        raise NotImplementedError
 
     @abc.abstractmethod
     def delete(self):
         """
         Deletes all objects contained in this query set from the database.
         """
+        raise NotImplementedError
 
     @abc.abstractmethod
     def sort(self, *args, **kwargs):
@@ -57,13 +59,14 @@ class QuerySet(object):
         See :py:meth:`blitzdb.backends.base.Backend.filter` for more
         details.
         """
+        raise NotImplementedError
 
     @abc.abstractmethod
     def __len__(self):
         """
         Return the number of documents contained in this query set.
         """
-        pass
+        raise NotImplementedError
 
     @abc.abstractmethod
     def __ne__(self, other):
@@ -72,8 +75,8 @@ class QuerySet(object):
 
         :param other: The object this query set is compared to.
         """
-        pass
-    
+        raise NotImplementedError
+
     @abc.abstractmethod
     def __eq__(self, other):
         """
@@ -81,3 +84,4 @@ class QuerySet(object):
         
         :param other: The object this query set is compared to.
         """
+        raise NotImplementedError

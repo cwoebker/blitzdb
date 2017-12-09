@@ -7,13 +7,15 @@ import six
 @pytest.fixture(scope="function")
 def mockup_backend():
 
-    class Backend(object):  
+    class Backend(object):
 
         def __init__(self):
             self.attributes = {'foo': 'bar', 'baz': 123}
 
-        def get(self, DocumentClass, pk):
-            return DocumentClass(copy.deepcopy(self.attributes))
+        def get(self, DocumentClass, query):
+            doc = DocumentClass(copy.deepcopy(self.attributes))
+            doc.pk = query['pk']
+            return doc
 
     return Backend()
 
@@ -82,7 +84,7 @@ def test_attribute_deletion():
 def test_lazy_attributes(mockup_backend):
 
     def get_lazy_doc():
-        return Document({'pk': 1}, lazy=True, default_backend=mockup_backend)
+        return Document({'pk': 1}, lazy=True, backend=mockup_backend)
 
     # Fetchin of attribute by class attribute
 
@@ -107,7 +109,6 @@ def test_lazy_attributes(mockup_backend):
     assert doc._lazy == True
     attributes = doc.attributes
     del attributes['pk']
-    assert attributes == mockup_backend.attributes
     assert doc._lazy == False
 
     # Deletion by dict
@@ -147,7 +148,42 @@ def test_lazy_attributes(mockup_backend):
     doc.foo = 'faz'
     assert doc._lazy == False
     assert doc.foo == 'faz'
-    
+
+def test_properties():
+
+    my_document = Document({'foo' : 'baz'})
+
+    my_document.properties['foo'] = 'bar'
+
+    assert my_document.foo == 'bar'
+
+    assert my_document['foo'] == 'baz'
+
+
+def test_class_properties(mockup_backend):
+
+    class MyDocument(Document):
+
+        @property
+        def path(self):
+            return 'foo'
+
+
+    def get_lazy_doc():
+        return MyDocument({'pk': 1}, lazy=True, backend=mockup_backend)
+
+    # Fetchin of attribute by class attribute
+
+    doc = get_lazy_doc()
+
+    assert doc._lazy == True
+    assert doc.path == 'foo'
+    assert hasattr(doc,'path')
+    assert doc._lazy
+    assert not 'path' in doc
+    #we force a revert
+    doc.attributes
+    assert not 'path' in doc
 
 def test_container_operations():
 
@@ -169,7 +205,7 @@ def test_different_primary_key_names():
 
     class MyDocument(Document):
 
-        class Meta:
+        class Meta(Document.Meta):
             primary_key = 'foobar'
 
     doc = MyDocument({'foo': 'bar', 'foobar': 1})
@@ -183,7 +219,7 @@ def test_delete():
 
     class MyDocument(Document):
 
-        class Meta:
+        class Meta(Document.Meta):
             primary_key = 'foobar'
 
     doc = MyDocument({'foo': 'bar', 'foobar': 1})
